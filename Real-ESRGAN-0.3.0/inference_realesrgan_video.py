@@ -7,6 +7,8 @@ import os
 import shutil
 import subprocess
 import torch
+import queue
+import threading
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from basicsr.utils.download_util import load_file_from_url
 from os import path as osp
@@ -79,6 +81,11 @@ class Reader:
             self.audio = meta['audio']
             self.nb_frames = meta['nb_frames']
 
+            self.queue = queue.Queue(maxsize=10)
+            self.thread = threading.Thread(target=self.read_worker)
+            self.thread.daemon = True
+            self.thread.start()
+
         else:
             if self.input_type.startswith('image'):
                 self.paths = [args.input]
@@ -94,6 +101,15 @@ class Reader:
             tmp_img = Image.open(self.paths[0])
             self.width, self.height = tmp_img.size
         self.idx = 0
+
+    def read_worker(self):
+        while True:
+            img_bytes = self.stream_reader.stdout.read(self.width * self.height * 3)  # 3 bytes for one pixel
+            if not img_bytes:
+                self.queue.put(None)
+                break
+            img = np.frombuffer(img_bytes, np.uint8).reshape([self.height, self.width, 3])
+            self.queue.put(img)
 
     def get_resolution(self):
         return self.height, self.width
@@ -112,11 +128,7 @@ class Reader:
         return self.nb_frames
 
     def get_frame_from_stream(self):
-        img_bytes = self.stream_reader.stdout.read(self.width * self.height * 3)  # 3 bytes for one pixel
-        if not img_bytes:
-            return None
-        img = np.frombuffer(img_bytes, np.uint8).reshape([self.height, self.width, 3])
-        return img
+        return self.queue.get()
 
     def get_frame_from_list(self):
         if self.idx >= self.nb_frames:
@@ -164,11 +176,25 @@ class Writer:
                                  loglevel='error').overwrite_output().run_async(
                                      pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
 
+        self.queue = queue.Queue(maxsize=10)
+        self.thread = threading.Thread(target=self.write_worker)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def write_worker(self):
+        while True:
+            frame = self.queue.get()
+            if frame is None:
+                break
+            frame = frame.astype(np.uint8).tobytes()
+            self.stream_writer.stdin.write(frame)
+
     def write_frame(self, frame):
-        frame = frame.astype(np.uint8).tobytes()
-        self.stream_writer.stdin.write(frame)
+        self.queue.put(frame)
 
     def close(self):
+        self.queue.put(None)
+        self.thread.join()
         self.stream_writer.stdin.close()
         self.stream_writer.wait()
 
@@ -178,6 +204,8 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         print(f"Worker {worker_idx} started. Output path: {video_save_path}")
         # ---------------------- determine models according to model names ---------------------- #
         args.model_name = args.model_name.split('.pth')[0]
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
         if args.model_name == 'RealESRGAN_x4plus':  # x4 RRDBNet model
             model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
             netscale = 4
@@ -274,7 +302,7 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
             else:
                 writer.write_frame(output)
 
-            torch.cuda.synchronize(device)
+            # torch.cuda.synchronize(device)
             pbar.update(1)
 
         reader.close()
