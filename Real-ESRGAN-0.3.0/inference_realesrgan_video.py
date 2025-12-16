@@ -32,7 +32,10 @@ def get_video_meta_info(video_path):
     ret['height'] = video_streams[0]['height']
     ret['fps'] = eval(video_streams[0]['avg_frame_rate'])
     ret['audio'] = ffmpeg.input(video_path).audio if has_audio else None
-    ret['nb_frames'] = int(video_streams[0]['nb_frames'])
+    if 'nb_frames' in video_streams[0]:
+        ret['nb_frames'] = int(video_streams[0]['nb_frames'])
+    else:
+        ret['nb_frames'] = int(float(probe['format']['duration']) * ret['fps'])
     return ret
 
 
