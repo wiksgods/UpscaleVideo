@@ -81,7 +81,7 @@ class Reader:
             self.audio = meta['audio']
             self.nb_frames = meta['nb_frames']
 
-            self.queue = queue.Queue(maxsize=10)
+            self.queue = queue.Queue(maxsize=30)
             self.thread = threading.Thread(target=self.read_worker)
             self.thread.daemon = True
             self.thread.start()
@@ -176,7 +176,7 @@ class Writer:
                                  loglevel='error').overwrite_output().run_async(
                                      pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
 
-        self.queue = queue.Queue(maxsize=10)
+        self.queue = queue.Queue(maxsize=30)
         self.thread = threading.Thread(target=self.write_worker)
         self.thread.daemon = True
         self.thread.start()
@@ -206,6 +206,8 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         args.model_name = args.model_name.split('.pth')[0]
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         if args.model_name == 'RealESRGAN_x4plus':  # x4 RRDBNet model
             model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
             netscale = 4
@@ -251,6 +253,15 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
             dni_weight = [args.denoise_strength, 1 - args.denoise_strength]
 
         # restorer
+        if args.tile == 0 and torch.cuda.is_available():
+            total_memory = torch.cuda.get_device_properties(device).total_memory
+            if total_memory > 8 * 1024**3:
+                args.tile = 0
+            elif total_memory > 6 * 1024**3:
+                args.tile = 400
+            else:
+                args.tile = 200
+        
         upsampler = RealESRGANer(
             scale=netscale,
             model_path=model_path,
@@ -286,24 +297,25 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         writer = Writer(args, audio, height, width, video_save_path, fps)
 
         pbar = tqdm(total=len(reader), unit='frame', desc='inference')
-        while True:
-            img = reader.get_frame()
-            if img is None:
-                break
+        with torch.no_grad():
+            while True:
+                img = reader.get_frame()
+                if img is None:
+                    break
 
-            try:
-                if args.face_enhance:
-                    _, _, output = face_enhancer.enhance(img, has_aligned=False, only_center_face=False, paste_back=True)
+                try:
+                    if args.face_enhance:
+                        _, _, output = face_enhancer.enhance(img, has_aligned=False, only_center_face=False, paste_back=True)
+                    else:
+                        output, _ = upsampler.enhance(img, outscale=args.outscale)
+                except RuntimeError as error:
+                    print('Error', error)
+                    print('If you encounter CUDA out of memory, try to set --tile with a smaller number.')
                 else:
-                    output, _ = upsampler.enhance(img, outscale=args.outscale)
-            except RuntimeError as error:
-                print('Error', error)
-                print('If you encounter CUDA out of memory, try to set --tile with a smaller number.')
-            else:
-                writer.write_frame(output)
+                    writer.write_frame(output)
 
-            # torch.cuda.synchronize(device)
-            pbar.update(1)
+                # torch.cuda.synchronize(device)
+                pbar.update(1)
 
         reader.close()
         writer.close()
@@ -396,9 +408,9 @@ def main():
               'Only used for the realesr-general-x4v3 model'))
     parser.add_argument('-s', '--outscale', type=float, default=4, help='The final upsampling scale of the image')
     parser.add_argument('--suffix', type=str, default='out', help='Suffix of the restored video')
-    parser.add_argument('-t', '--tile', type=int, default=0, help='Tile size, 0 for no tile during testing')
+    parser.add_argument('-t', '--tile', type=int, default=0, help='Tile size, 0 for auto-detect based on VRAM')
     parser.add_argument('--tile_pad', type=int, default=10, help='Tile padding')
-    parser.add_argument('--pre_pad', type=int, default=0, help='Pre padding size at each border')
+    parser.add_argument('--pre_pad', type=int, default=10, help='Pre padding size at each border')
     parser.add_argument('--face_enhance', action='store_true', help='Use GFPGAN to enhance face')
     parser.add_argument(
         '--fp32', action='store_true', help='Use fp32 precision during inference. Default: fp16 (half precision).')
